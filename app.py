@@ -34,6 +34,7 @@ SYSTEM_INSTRUCTION = (
     "kuntosaliharjoittelusta, juoksusta ja joukkueurheilun yhdistämisestä."
 )
 PRIMARY_MODEL = "gemini-1.5-flash-latest"
+APP_VERSION = "v0.9.3"
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -69,6 +70,15 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS pr_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exercise_name TEXT NOT NULL UNIQUE,
+                weight REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             INSERT OR IGNORE INTO profile (id, name, squat, rdl, weekly_schedule)
             VALUES (1, ?, ?, ?, ?)
             """,
@@ -79,6 +89,16 @@ def init_db() -> None:
                 DEFAULT_PROFILE["weekly_schedule"],
             ),
         )
+        pr_count = conn.execute("SELECT COUNT(*) AS c FROM pr_records").fetchone()["c"]
+        if pr_count == 0:
+            conn.execute(
+                "INSERT OR IGNORE INTO pr_records (exercise_name, weight) VALUES (?, ?)",
+                ("Squat", DEFAULT_PROFILE["pr_results"]["Squat"]),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO pr_records (exercise_name, weight) VALUES (?, ?)",
+                ("RDL", DEFAULT_PROFILE["pr_results"]["RDL"]),
+            )
 
 
 def load_profile_data() -> Dict:
@@ -86,20 +106,28 @@ def load_profile_data() -> Dict:
         row = conn.execute(
             "SELECT name, squat, rdl, weekly_schedule FROM profile WHERE id = 1"
         ).fetchone()
+        pr_rows = conn.execute(
+            "SELECT exercise_name, weight FROM pr_records ORDER BY exercise_name COLLATE NOCASE"
+        ).fetchall()
     if not row:
         return DEFAULT_PROFILE.copy()
+    pr_results = {}
+    for pr_row in pr_rows:
+        pr_results[pr_row["exercise_name"]] = float(pr_row["weight"])
+    if not pr_results:
+        pr_results = DEFAULT_PROFILE["pr_results"].copy()
     return {
         "name": row["name"],
-        "pr_results": {
-            "Squat": float(row["squat"]),
-            "RDL": float(row["rdl"]),
-        },
+        "pr_results": pr_results,
         "weekly_schedule": row["weekly_schedule"],
     }
 
 
 def save_profile_data(data: Dict) -> None:
     with get_db_connection() as conn:
+        pr_results = data.get("pr_results", {})
+        squat_value = float(pr_results.get("Squat", DEFAULT_PROFILE["pr_results"]["Squat"]))
+        rdl_value = float(pr_results.get("RDL", DEFAULT_PROFILE["pr_results"]["RDL"]))
         conn.execute(
             """
             INSERT INTO profile (id, name, squat, rdl, weekly_schedule)
@@ -112,11 +140,20 @@ def save_profile_data(data: Dict) -> None:
             """,
             (
                 data.get("name", ""),
-                float(data.get("pr_results", {}).get("Squat", 0)),
-                float(data.get("pr_results", {}).get("RDL", 0)),
+                squat_value,
+                rdl_value,
                 data.get("weekly_schedule", ""),
             ),
         )
+        conn.execute("DELETE FROM pr_records")
+        for exercise_name, weight in pr_results.items():
+            clean_name = str(exercise_name).strip()
+            if not clean_name:
+                continue
+            conn.execute(
+                "INSERT INTO pr_records (exercise_name, weight) VALUES (?, ?)",
+                (clean_name, float(weight)),
+            )
 
 
 def load_training_log() -> list[Dict]:
@@ -236,9 +273,16 @@ def apply_theme() -> None:
 
 
 def calculate_recommendation(exercise_name: str, percentage: float, pr_data: Dict) -> str:
-    key = EXERCISE_TO_PR_KEY.get(exercise_name.strip().lower())
+    entered = exercise_name.strip()
+    if not entered:
+        return "Tyhjä liikenimi."
+    pr_lookup = {name.lower(): name for name in pr_data.keys()}
+    key = pr_lookup.get(entered.lower())
     if not key:
-        return f"{exercise_name}: Ei tunnettu PR-pohjaista liikettä."
+        mapped = EXERCISE_TO_PR_KEY.get(entered.lower())
+        key = mapped if mapped in pr_data else None
+    if not key:
+        return f"{exercise_name}: Ei PR-arvoa. Lisää liike ensin Profiili & PR -osiossa."
     max_weight = float(pr_data.get(key, 0))
     recommended = max_weight * (percentage / 100.0)
     return f"{exercise_name}: {recommended:.1f} kg ({percentage:.0f}% {key}-maksimista)"
@@ -377,25 +421,61 @@ def render_weekly_plan_tab() -> None:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Profiili & PR-tulokset")
     data = st.session_state.profile_data
-    col_a, col_b, col_c = st.columns([1.4, 1, 1])
-    with col_a:
-        data["name"] = st.text_input("Nimi", value=data.get("name", ""), key="profile_name")
-    with col_b:
-        data["pr_results"]["Squat"] = st.number_input(
-            "Squat (kg)",
-            min_value=0.0,
-            value=float(data["pr_results"].get("Squat", 0)),
-            step=1.0,
-            key="profile_squat",
-        )
-    with col_c:
-        data["pr_results"]["RDL"] = st.number_input(
-            "RDL (kg)",
-            min_value=0.0,
-            value=float(data["pr_results"].get("RDL", 0)),
-            step=1.0,
-            key="profile_rdl",
-        )
+    data["name"] = st.text_input("Nimi", value=data.get("name", ""), key="profile_name")
+    st.markdown("### PR-liikkeet (kg)")
+    pr_results = data.get("pr_results", {})
+    st.caption("Muokkaa nykyisiä ennätyksiä tai lisää uusi liike alempaa.")
+    for idx, exercise_name in enumerate(sorted(pr_results.keys(), key=str.lower)):
+        row_col1, row_col2 = st.columns([3, 1])
+        weight_key = f"pr_weight_{idx}_{exercise_name.lower().replace(' ', '_')}"
+        with row_col1:
+            new_weight = st.number_input(
+                f"{exercise_name} (kg)",
+                min_value=0.0,
+                value=float(pr_results.get(exercise_name, 0)),
+                step=1.0,
+                key=weight_key,
+            )
+            pr_results[exercise_name] = new_weight
+        with row_col2:
+            if st.button("Poista", key=f"pr_delete_{idx}"):
+                pr_results.pop(exercise_name, None)
+                if not pr_results:
+                    pr_results.update(DEFAULT_PROFILE["pr_results"])
+                st.rerun()
+
+    st.markdown("#### Lisaa uusi PR-liike")
+    with st.form("add_pr_form", clear_on_submit=True):
+        add_col1, add_col2 = st.columns([2.5, 1])
+        with add_col1:
+            new_exercise_name = st.text_input(
+                "Liikkeen nimi",
+                placeholder="Esim. Penkki",
+                key="new_pr_name",
+            )
+        with add_col2:
+            new_exercise_weight = st.number_input(
+                "PR (kg)",
+                min_value=0.0,
+                value=0.0,
+                step=1.0,
+                key="new_pr_weight",
+            )
+        add_submit = st.form_submit_button("Lisää liike")
+
+    if add_submit:
+        clean_name = new_exercise_name.strip()
+        existing_names = {name.lower() for name in pr_results.keys()}
+        if not clean_name:
+            st.warning("Anna liikkeelle nimi.")
+        elif clean_name.lower() in existing_names:
+            st.warning("Liike on jo listassa.")
+        else:
+            pr_results[clean_name] = float(new_exercise_weight)
+            st.success(f"Lisatty liike: {clean_name}")
+            st.rerun()
+
+    data["pr_results"] = pr_results
     if st.button("Tallenna profiili", key="save_profile_tab"):
         save_profile_data(data)
         st.success("Profiili tallennettu.")
@@ -448,8 +528,8 @@ def render_weekly_plan_tab() -> None:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("Tallennetut PR:t")
         pr = st.session_state.profile_data["pr_results"]
-        st.metric("Squat", f"{pr.get('Squat', 0):.0f} kg")
-        st.metric("RDL", f"{pr.get('RDL', 0):.0f} kg")
+        for pr_name, pr_value in sorted(pr.items(), key=lambda item: item[0].lower()):
+            st.metric(pr_name, f"{float(pr_value):.0f} kg")
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -569,6 +649,7 @@ def main() -> None:
     init_state()
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Gemini API")
+    st.sidebar.caption(f"Hybridivalmentaja {APP_VERSION}")
     entered_api_key = st.sidebar.text_input(
         "API-avain",
         type="password",
@@ -586,6 +667,7 @@ def main() -> None:
         '<div class="subtitle">Yhdistä joukkueurheilu, sali ja juoksu fiksuksi viikoksi.</div>',
         unsafe_allow_html=True,
     )
+    st.caption(f"Sovellusversio: {APP_VERSION}")
 
     tab_weekly, tab_log, tab_chat = st.tabs(["Viikkosuunnitelma", "Treeniloki", "AI-Valmentaja"])
     with tab_weekly:
